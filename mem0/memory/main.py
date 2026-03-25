@@ -257,15 +257,20 @@ class Memory(MemoryBase):
             self.config.vector_store.provider, self.config.vector_store.config
         )
         self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        self._fallback_llm = None
+        if self.config.fallback_llm:
+            self._fallback_llm = LlmFactory.create(
+                self.config.fallback_llm.provider, self.config.fallback_llm.config
+            )
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
-        
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
             self.reranker = RerankerFactory.create(
-                config.reranker.provider, 
+                config.reranker.provider,
                 config.reranker.config
             )
 
@@ -512,7 +517,14 @@ class Memory(MemoryBase):
         _fact_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         for _attempt in range(3):
             try:
-                response = self.llm.generate_response(
+                # Switch to fallback LLM on 3rd attempt if configured
+                if _attempt == 2 and self._fallback_llm:
+                    logger.warning("Fact extraction: switching to fallback LLM on 3rd retry")
+                    _llm = self._fallback_llm
+                else:
+                    _llm = self.llm
+
+                response = _llm.generate_response(
                     messages=_fact_messages,
                     response_format={"type": "json_object"},
                 )
@@ -1374,15 +1386,20 @@ class AsyncMemory(MemoryBase):
             self.config.vector_store.provider, self.config.vector_store.config
         )
         self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        self._fallback_llm = None
+        if self.config.fallback_llm:
+            self._fallback_llm = LlmFactory.create(
+                self.config.fallback_llm.provider, self.config.fallback_llm.config
+            )
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
-        
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
             self.reranker = RerankerFactory.create(
-                config.reranker.provider, 
+                config.reranker.provider,
                 config.reranker.config
             )
 
@@ -1591,8 +1608,15 @@ class AsyncMemory(MemoryBase):
         _fact_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         for _attempt in range(3):
             try:
+                # Switch to fallback LLM on 3rd attempt if configured
+                if _attempt == 2 and self._fallback_llm:
+                    logger.warning("Fact extraction: switching to fallback LLM on 3rd retry")
+                    _llm = self._fallback_llm
+                else:
+                    _llm = self.llm
+
                 response = await asyncio.to_thread(
-                    self.llm.generate_response,
+                    _llm.generate_response,
                     messages=_fact_messages,
                     response_format={"type": "json_object"},
                 )
