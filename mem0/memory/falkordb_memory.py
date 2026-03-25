@@ -2,6 +2,9 @@ import logging
 
 from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
 
+# Required keys for a valid entity from LLM tool calls
+_ENTITY_REQUIRED_KEYS = {"source", "relationship", "destination"}
+
 try:
     from falkordb import FalkorDB
 except ImportError:
@@ -298,6 +301,18 @@ class MemoryGraph:
         if extracted_entities.get("tool_calls"):
             entities = extracted_entities["tool_calls"][0].get("arguments", {}).get("entities", [])
 
+        # Filter out entities with missing or invalid fields (defensive against incomplete LLM tool calls)
+        valid_entities = []
+        for entity in entities:
+            missing = _ENTITY_REQUIRED_KEYS - entity.keys()
+            if missing:
+                logger.warning("[_establish_nodes_relations] Skipping entity with missing fields: missing=%s, entity=%s", missing, entity)
+            elif not all(isinstance(entity.get(k), str) and entity[k].strip() for k in _ENTITY_REQUIRED_KEYS):
+                logger.warning("[_establish_nodes_relations] Skipping entity with empty/non-string values: entity=%s", entity)
+            else:
+                valid_entities.append(entity)
+        entities = valid_entities
+
         entities = self._remove_spaces_from_entities(entities)
         logger.debug(f"Extracted entities: {entities}")
         return entities
@@ -412,6 +427,15 @@ class MemoryGraph:
         results = []
 
         for item in to_be_deleted:
+            # Defensive: skip items with missing or invalid fields
+            missing = _ENTITY_REQUIRED_KEYS - item.keys()
+            if missing:
+                logger.warning("[_delete_entities] Skipping item with missing fields: missing=%s, item=%s", missing, item)
+                continue
+            if not all(isinstance(item.get(k), str) and item[k].strip() for k in _ENTITY_REQUIRED_KEYS):
+                logger.warning("[_delete_entities] Skipping item with empty/non-string values: item=%s", item)
+                continue
+
             source = item["source"]
             destination = item["destination"]
             relationship = item["relationship"]
@@ -466,6 +490,15 @@ class MemoryGraph:
         run_id = filters.get("run_id", None)
         results = []
         for item in to_be_added:
+            # Defensive: skip items with missing or invalid fields
+            missing = _ENTITY_REQUIRED_KEYS - item.keys()
+            if missing:
+                logger.warning("[_add_entities] Skipping item with missing fields: missing=%s, item=%s", missing, item)
+                continue
+            if not all(isinstance(item.get(k), str) and item[k].strip() for k in _ENTITY_REQUIRED_KEYS):
+                logger.warning("[_add_entities] Skipping item with empty/non-string values: item=%s", item)
+                continue
+
             # entities
             source = item["source"]
             destination = item["destination"]
