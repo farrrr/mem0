@@ -190,7 +190,7 @@ class MemoryGraph:
         where_clause = " AND ".join(where_conditions)
 
         cypher = f"""
-        MATCH (n:__Entity__)
+        MATCH (n:`__Entity__`)
         WHERE {where_clause}
         DETACH DELETE n
         """
@@ -220,7 +220,7 @@ class MemoryGraph:
         where_clause = " AND ".join(where_conditions)
 
         query = f"""
-        MATCH (n:__Entity__)-[r]->(m:__Entity__)
+        MATCH (n:`__Entity__`)-[r]->(m:`__Entity__`)
         WHERE {where_clause} AND (r.valid IS NULL OR r.valid = true)
         RETURN n.name AS source, type(r) AS relationship, m.name AS target
         LIMIT $limit
@@ -441,12 +441,12 @@ class MemoryGraph:
             WHERE {" AND ".join(filter_conditions)} AND similarity >= $threshold
             CALL {{
                 WITH n
-                MATCH (n)-[r]->(m:__Entity__)
+                MATCH (n)-[r]->(m:`__Entity__`)
                 WHERE {target_where} AND (r.valid IS NULL OR r.valid = true)
                 RETURN n.name AS source, id(n) AS source_id, type(r) AS relationship, id(r) AS relation_id, m.name AS destination, id(m) AS destination_id
                 UNION
                 WITH n
-                MATCH (n)<-[r]-(m:__Entity__)
+                MATCH (n)<-[r]-(m:`__Entity__`)
                 WHERE {target_where} AND (r.valid IS NULL OR r.valid = true)
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id, n.name AS destination, id(n) AS destination_id
             }}
@@ -564,7 +564,7 @@ class MemoryGraph:
             # Soft-delete: mark relationship as invalid instead of removing it,
             # enabling temporal reasoning over historical graph state.
             cypher = f"""
-            MATCH (n:__Entity__)-[r:`{relationship}`]->(m:__Entity__)
+            MATCH (n:`__Entity__`)-[r:`{relationship}`]->(m:`__Entity__`)
             WHERE {where_clause}
             SET r.valid = false, r.invalidated_at = timestamp()
             RETURN
@@ -699,11 +699,11 @@ class MemoryGraph:
 
                 # Use MATCH for existing source, MERGE for new destination
                 cypher = f"""
-                MATCH (source:__Entity__)
+                MATCH (source:`__Entity__`)
                 WHERE id(source) = $source_id
                 SET source.mentions = CASE WHEN source.mentions IS NULL THEN 1 ELSE source.mentions + 1 END
                 WITH source
-                MERGE (destination:__Entity__ {{{dest_merge_props_str}}})
+                MERGE (destination:`__Entity__` {{{dest_merge_props_str}}})
                 ON CREATE SET
                     destination.created = timestamp(),
                     destination.mentions = 1,
@@ -746,11 +746,11 @@ class MemoryGraph:
                 source_merge_props_str = ", ".join(source_merge_props)
 
                 cypher = f"""
-                MATCH (destination:__Entity__)
+                MATCH (destination:`__Entity__`)
                 WHERE id(destination) = $destination_id
                 SET destination.mentions = CASE WHEN destination.mentions IS NULL THEN 1 ELSE destination.mentions + 1 END
                 WITH destination
-                MERGE (source:__Entity__ {{{source_merge_props_str}}})
+                MERGE (source:`__Entity__` {{{source_merge_props_str}}})
                 ON CREATE SET
                     source.created = timestamp(),
                     source.mentions = 1,
@@ -787,11 +787,11 @@ class MemoryGraph:
                     params["run_id"] = run_id
 
                 cypher = f"""
-                MATCH (source:__Entity__)
+                MATCH (source:`__Entity__`)
                 WHERE id(source) = $source_id
                 SET source.mentions = CASE WHEN source.mentions IS NULL THEN 1 ELSE source.mentions + 1 END
                 WITH source
-                MATCH (destination:__Entity__)
+                MATCH (destination:`__Entity__`)
                 WHERE id(destination) = $destination_id
                 SET destination.mentions = CASE WHEN destination.mentions IS NULL THEN 1 ELSE destination.mentions + 1 END
                 MERGE (source)-[r:`{relationship}`]->(destination)
@@ -833,7 +833,7 @@ class MemoryGraph:
                 dest_merge_props_str = ", ".join(dest_merge_props)
 
                 cypher = f"""
-                MERGE (source:__Entity__ {{{source_merge_props_str}}})
+                MERGE (source:`__Entity__` {{{source_merge_props_str}}})
                 ON CREATE SET source.created = timestamp(),
                             source.mentions = 1,
                             source.entity_type = $source_type
@@ -841,7 +841,7 @@ class MemoryGraph:
                 WITH source
                 CALL db.create.setNodeVectorProperty(source, 'embedding', vecf32($source_embedding))
                 WITH source
-                MERGE (destination:__Entity__ {{{dest_merge_props_str}}})
+                MERGE (destination:`__Entity__` {{{dest_merge_props_str}}})
                 ON CREATE SET destination.created = timestamp(),
                             destination.mentions = 1,
                             destination.entity_type = $destination_type
