@@ -475,8 +475,8 @@ class MemoryGraph:
             destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=self.threshold)
 
             if not destination_node_search_result and source_node_search_result:
-                # Source found, destination not found — create destination
-                dest_where = ["dest.name = $destination_name", "dest.user_id = $user_id"]
+                # Source found, destination not found -- build destination MERGE props dynamically
+                dest_merge_props = ["name: $destination_name", "user_id: $user_id"]
                 params = {
                     "source_id": source_node_search_result[0]["id(source_candidate)"],
                     "destination_name": destination,
@@ -485,11 +485,12 @@ class MemoryGraph:
                     "user_id": user_id,
                 }
                 if agent_id:
-                    dest_where.append("dest.agent_id = $agent_id")
+                    dest_merge_props.append("agent_id: $agent_id")
                     params["agent_id"] = agent_id
                 if run_id:
-                    dest_where.append("dest.run_id = $run_id")
+                    dest_merge_props.append("run_id: $run_id")
                     params["run_id"] = run_id
+                dest_merge_props_str = ", ".join(dest_merge_props)
 
                 # Use MATCH for existing source, MERGE for new destination
                 cypher = f"""
@@ -497,7 +498,7 @@ class MemoryGraph:
                 WHERE id(source) = $source_id
                 SET source.mentions = CASE WHEN source.mentions IS NULL THEN 1 ELSE source.mentions + 1 END
                 WITH source
-                MERGE (destination:__Entity__ {{name: $destination_name, user_id: $user_id{', agent_id: $agent_id' if agent_id else ''}{', run_id: $run_id' if run_id else ''}}})
+                MERGE (destination:__Entity__ {{{dest_merge_props_str}}})
                 ON CREATE SET
                     destination.created = timestamp(),
                     destination.mentions = 1,
@@ -519,7 +520,8 @@ class MemoryGraph:
                 """
 
             elif destination_node_search_result and not source_node_search_result:
-                # Destination found, source not found — create source
+                # Destination found, source not found -- build source MERGE props dynamically
+                source_merge_props = ["name: $source_name", "user_id: $user_id"]
                 params = {
                     "destination_id": destination_node_search_result[0]["id(destination_candidate)"],
                     "source_name": source,
@@ -528,16 +530,19 @@ class MemoryGraph:
                     "user_id": user_id,
                 }
                 if agent_id:
+                    source_merge_props.append("agent_id: $agent_id")
                     params["agent_id"] = agent_id
                 if run_id:
+                    source_merge_props.append("run_id: $run_id")
                     params["run_id"] = run_id
+                source_merge_props_str = ", ".join(source_merge_props)
 
                 cypher = f"""
                 MATCH (destination:__Entity__)
                 WHERE id(destination) = $destination_id
                 SET destination.mentions = CASE WHEN destination.mentions IS NULL THEN 1 ELSE destination.mentions + 1 END
                 WITH destination
-                MERGE (source:__Entity__ {{name: $source_name, user_id: $user_id{', agent_id: $agent_id' if agent_id else ''}{', run_id: $run_id' if run_id else ''}}})
+                MERGE (source:__Entity__ {{{source_merge_props_str}}})
                 ON CREATE SET
                     source.created = timestamp(),
                     source.mentions = 1,
@@ -559,7 +564,7 @@ class MemoryGraph:
                 """
 
             elif source_node_search_result and destination_node_search_result:
-                # Both found — just create/merge the relationship
+                # Both found -- just create/merge the relationship (no MERGE node needed)
                 params = {
                     "source_id": source_node_search_result[0]["id(source_candidate)"],
                     "destination_id": destination_node_search_result[0]["id(destination_candidate)"],
@@ -590,7 +595,9 @@ class MemoryGraph:
                 """
 
             else:
-                # Neither found — create both nodes and the relationship
+                # Neither found -- build MERGE props for both source and destination
+                source_merge_props = ["name: $source_name", "user_id: $user_id"]
+                dest_merge_props = ["name: $dest_name", "user_id: $user_id"]
                 params = {
                     "source_name": source,
                     "dest_name": destination,
@@ -601,12 +608,18 @@ class MemoryGraph:
                     "user_id": user_id,
                 }
                 if agent_id:
+                    source_merge_props.append("agent_id: $agent_id")
+                    dest_merge_props.append("agent_id: $agent_id")
                     params["agent_id"] = agent_id
                 if run_id:
+                    source_merge_props.append("run_id: $run_id")
+                    dest_merge_props.append("run_id: $run_id")
                     params["run_id"] = run_id
+                source_merge_props_str = ", ".join(source_merge_props)
+                dest_merge_props_str = ", ".join(dest_merge_props)
 
                 cypher = f"""
-                MERGE (source:__Entity__ {{name: $source_name, user_id: $user_id{', agent_id: $agent_id' if agent_id else ''}{', run_id: $run_id' if run_id else ''}}})
+                MERGE (source:__Entity__ {{{source_merge_props_str}}})
                 ON CREATE SET source.created = timestamp(),
                             source.mentions = 1,
                             source.entity_type = $source_type
@@ -614,7 +627,7 @@ class MemoryGraph:
                 WITH source
                 CALL db.create.setNodeVectorProperty(source, 'embedding', vecf32($source_embedding))
                 WITH source
-                MERGE (destination:__Entity__ {{name: $dest_name, user_id: $user_id{', agent_id: $agent_id' if agent_id else ''}{', run_id: $run_id' if run_id else ''}}})
+                MERGE (destination:__Entity__ {{{dest_merge_props_str}}})
                 ON CREATE SET destination.created = timestamp(),
                             destination.mentions = 1,
                             destination.entity_type = $destination_type
@@ -632,6 +645,7 @@ class MemoryGraph:
                     r.updated_at = timestamp()
                 RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                 """
+
 
             result = self.graph.query(cypher, params)
             results.append(result.result_set)
