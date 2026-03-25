@@ -49,7 +49,8 @@ class MemoryGraph:
 
         # Create vector index on the embedding property for __Entity__ nodes
         try:
-            embedding_dim = self.config.embedder.config.get("embedding_dims", 1536)
+            ecfg = self.config.embedder.config
+            embedding_dim = ecfg.get("embedding_dims", 1536) if isinstance(ecfg, dict) else getattr(ecfg, "embedding_dims", 1536)
             if embedding_dim == 1536 and self.config.embedder.provider != "openai":
                 logger.warning(
                     "embedding_dims not set, defaulting to 1536 (OpenAI ada-002). "
