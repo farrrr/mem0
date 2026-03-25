@@ -483,12 +483,80 @@ class MemoryGraph:
 
         return results
 
+    def _get_openai_embed_client(self):
+        """Lazy singleton for OpenAI embedding client used by _batch_embed."""
+        if not hasattr(self, "_openai_embed_client"):
+            from openai import OpenAI
+            ecfg = self.config.embedder.config
+            if isinstance(ecfg, dict):
+                api_key = ecfg.get("api_key")
+                base_url = ecfg.get("openai_base_url")
+            else:
+                api_key = getattr(ecfg, "api_key", None)
+                base_url = getattr(ecfg, "openai_base_url", None)
+            self._openai_embed_client = OpenAI(api_key=api_key, base_url=base_url)
+        return self._openai_embed_client
+
+    def _batch_embed(self, texts):
+        """Batch embed multiple texts in a single API call. Returns list of embeddings.
+
+        Only uses native batch for the OpenAI provider.
+        Falls back to sequential embed() for all other providers.
+        """
+        if not texts:
+            return []
+
+        provider = self.config.embedder.provider
+        if provider != "openai":
+            return [self.embedding_model.embed(t) for t in texts]
+
+        try:
+            client = self._get_openai_embed_client()
+            ecfg = self.config.embedder.config
+            model = ecfg.get("model") if isinstance(ecfg, dict) else getattr(ecfg, "model", None)
+            dims = ecfg.get("embedding_dims") if isinstance(ecfg, dict) else getattr(ecfg, "embedding_dims", None)
+
+            kwargs = {"input": texts, "model": model}
+            if dims is not None:
+                kwargs["dimensions"] = dims
+            resp = client.embeddings.create(**kwargs)
+            # Sort by index to guarantee order matches input
+            sorted_data = sorted(resp.data, key=lambda d: d.index)
+            return [d.embedding for d in sorted_data]
+        except Exception as e:
+            logger.warning("Batch embed failed (%s), falling back to sequential", type(e).__name__)
+            return [self.embedding_model.embed(t) for t in texts]
+
     def _add_entities(self, to_be_added, filters, entity_type_map):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
         user_id = filters["user_id"]
         agent_id = filters.get("agent_id", None)
         run_id = filters.get("run_id", None)
         results = []
+
+        if not to_be_added:
+            return results
+
+        # --- Batch embed all unique entities upfront ---
+        # Defensive: skip items missing source/destination (incomplete LLM tool calls)
+        unique_entities = sorted(
+            {item["source"] for item in to_be_added if "source" in item}
+            | {item["destination"] for item in to_be_added if "destination" in item}
+        )
+        unique_embeddings = self._batch_embed(unique_entities)
+        embedding_cache = dict(zip(unique_entities, unique_embeddings))
+
+        # Pre-compute node searches using cached embeddings.
+        # source and destination searches return different column aliases,
+        # so we maintain separate caches but share the same embeddings.
+        source_node_cache = {}
+        dest_node_cache = {}
+        for entity, emb in embedding_cache.items():
+            source_node_cache[entity] = self._search_source_node(emb, filters, threshold=self.threshold)
+            dest_node_cache[entity] = self._search_destination_node(emb, filters, threshold=self.threshold)
+
+        logger.debug(f"Batch embedded {len(unique_entities)} unique entities, cached {len(source_node_cache)} node lookups")
+
         for item in to_be_added:
             # Defensive: skip items with missing or invalid fields
             missing = _ENTITY_REQUIRED_KEYS - item.keys()
@@ -508,13 +576,13 @@ class MemoryGraph:
             source_type = entity_type_map.get(source, "__User__")
             destination_type = entity_type_map.get(destination, "__User__")
 
-            # embeddings
-            source_embedding = self.embedding_model.embed(source)
-            dest_embedding = self.embedding_model.embed(destination)
+            # embeddings (from batch cache, fallback to individual embed)
+            source_embedding = embedding_cache[source] if source in embedding_cache else self.embedding_model.embed(source)
+            dest_embedding = embedding_cache[destination] if destination in embedding_cache else self.embedding_model.embed(destination)
 
-            # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(source_embedding, filters, threshold=self.threshold)
-            destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=self.threshold)
+            # search for the nodes with the closest embeddings (from pre-computed cache)
+            source_node_search_result = source_node_cache[source] if source in source_node_cache else self._search_source_node(source_embedding, filters, threshold=self.threshold)
+            destination_node_search_result = dest_node_cache[destination] if destination in dest_node_cache else self._search_destination_node(dest_embedding, filters, threshold=self.threshold)
 
             if not destination_node_search_result and source_node_search_result:
                 # Source found, destination not found -- build destination MERGE props dynamically
