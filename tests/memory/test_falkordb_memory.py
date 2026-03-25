@@ -80,7 +80,7 @@ class TestInit:
         config = MagicMock()
         config.graph_store.config.host = "localhost"
         config.graph_store.config.port = 6379
-        config.graph_store.config.graph_name = "test_graph"
+        config.graph_store.config.database = "test_graph"
         config.graph_store.config.username = None
         config.graph_store.config.password = None
         config.graph_store.custom_prompt = None
@@ -105,17 +105,17 @@ class TestInit:
 
             assert mg.config is config
             assert mg.threshold == 0.8
+            # Per-user graph: FalkorDB client created but select_graph not called at init
             mock_fdb.assert_called_once_with(
-                host="localhost", port=6379, username=None, password=None,
+                host="localhost", port=6379,
             )
-            mock_fdb.return_value.select_graph.assert_called_once_with("test_graph")
 
     def test_init_graph_store_llm_takes_priority(self):
         """If graph_store.llm is configured, it should override config.llm."""
         config = MagicMock()
         config.graph_store.config.host = "localhost"
         config.graph_store.config.port = 6379
-        config.graph_store.config.graph_name = "test"
+        config.graph_store.config.database = "test"
         config.graph_store.config.username = None
         config.graph_store.config.password = None
         config.graph_store.custom_prompt = None
@@ -137,12 +137,12 @@ class TestInit:
             mg = MemoryGraph(config)
             assert mg.llm_provider == "azure_openai"
 
-    def test_init_creates_vector_and_range_indexes(self):
-        """Init should attempt to create vector index and range indexes."""
+    def test_lazy_index_creation_on_first_access(self):
+        """Indexes should be created lazily on first user graph access, not at init."""
         config = MagicMock()
         config.graph_store.config.host = "localhost"
         config.graph_store.config.port = 6379
-        config.graph_store.config.graph_name = "test"
+        config.graph_store.config.database = "test"
         config.graph_store.config.username = None
         config.graph_store.config.password = None
         config.graph_store.custom_prompt = None
@@ -161,20 +161,26 @@ class TestInit:
             mock_graph = MagicMock()
             mock_fdb.return_value.select_graph.return_value = mock_graph
             mock_lf.create.return_value = MagicMock()
-            MemoryGraph(config)
+            mg = MemoryGraph(config)
 
-            mock_graph.create_node_vector_index.assert_called_once_with(
-                "__Entity__", "embedding", dim=768, similarity_function="cosine"
-            )
-            # Range indexes for user_id and name
-            assert mock_graph.create_node_range_index.call_count == 2
+            # No index creation at init (lazy)
+            mock_graph.create_node_vector_index.assert_not_called()
+            mock_graph.create_node_range_index.assert_not_called()
+
+            # Trigger lazy index creation
+            mg._ensure_user_graph_indexes("test_user")
+
+            mock_graph.create_node_range_index.assert_called_once_with("__Entity__", "name")
+            # Second call should be cached (no additional index creation)
+            mg._ensure_user_graph_indexes("test_user")
+            mock_graph.create_node_range_index.assert_called_once()
 
     def test_init_fallback_llm_configured(self):
         """Init should set up fallback_llm when config provides it."""
         config = MagicMock()
         config.graph_store.config.host = "localhost"
         config.graph_store.config.port = 6379
-        config.graph_store.config.graph_name = "test"
+        config.graph_store.config.database = "test"
         config.graph_store.config.username = None
         config.graph_store.config.password = None
         config.graph_store.custom_prompt = None
