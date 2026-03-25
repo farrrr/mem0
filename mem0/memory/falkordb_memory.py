@@ -140,7 +140,7 @@ class MemoryGraph:
         Delete graph entities associated with the given memory text.
 
         Extracts entities and relationships from the memory text using the same
-        pipeline as add(), then hard-deletes the matching relationships in the graph.
+        pipeline as add(), then soft-deletes the matching relationships in the graph.
 
         Args:
             data (str): The memory text whose graph entities should be removed.
@@ -158,6 +158,12 @@ class MemoryGraph:
             logger.error(f"Error during graph cleanup for memory delete: {e}")
 
     def delete_all(self, filters):
+        """Delete all nodes and relationships for a user (hard delete).
+
+        Unlike delete() which soft-deletes individual relationships,
+        delete_all() permanently removes all data including soft-deleted
+        history. This is intentional — consistent with upstream behavior.
+        """
         # Build WHERE conditions for filtering
         where_conditions = ["n.user_id = $user_id"]
         params = {"user_id": filters["user_id"]}
@@ -201,7 +207,7 @@ class MemoryGraph:
 
         query = f"""
         MATCH (n:__Entity__)-[r]->(m:__Entity__)
-        WHERE {where_clause}
+        WHERE {where_clause} AND (r.valid IS NULL OR r.valid = true)
         RETURN n.name AS source, type(r) AS relationship, m.name AS target
         LIMIT $limit
         """
@@ -326,12 +332,12 @@ class MemoryGraph:
             CALL {{
                 WITH n
                 MATCH (n)-[r]->(m:__Entity__)
-                WHERE {target_where}
+                WHERE {target_where} AND (r.valid IS NULL OR r.valid = true)
                 RETURN n.name AS source, id(n) AS source_id, type(r) AS relationship, id(r) AS relation_id, m.name AS destination, id(m) AS destination_id
                 UNION
                 WITH n
                 MATCH (n)<-[r]-(m:__Entity__)
-                WHERE {target_where}
+                WHERE {target_where} AND (r.valid IS NULL OR r.valid = true)
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id, n.name AS destination, id(n) AS destination_id
             }}
             WITH DISTINCT source, source_id, relationship, relation_id, destination, destination_id, similarity
@@ -399,7 +405,7 @@ class MemoryGraph:
         return to_be_deleted
 
     def _delete_entities(self, to_be_deleted, filters):
-        """Delete the entities from the graph (hard delete)."""
+        """Soft-delete relationships by marking r.valid = false."""
         user_id = filters["user_id"]
         agent_id = filters.get("agent_id", None)
         run_id = filters.get("run_id", None)
@@ -416,6 +422,8 @@ class MemoryGraph:
                 "n.user_id = $user_id",
                 "m.name = $dest_name",
                 "m.user_id = $user_id",
+                # Only soft-delete relationships that are still valid
+                "(r.valid IS NULL OR r.valid = true)",
             ]
             params = {
                 "source_name": source,
@@ -434,11 +442,12 @@ class MemoryGraph:
 
             where_clause = " AND ".join(where_conditions)
 
-            # Hard delete: remove the relationship entirely
+            # Soft-delete: mark relationship as invalid instead of removing it,
+            # enabling temporal reasoning over historical graph state.
             cypher = f"""
             MATCH (n:__Entity__)-[r:`{relationship}`]->(m:__Entity__)
             WHERE {where_clause}
-            DELETE r
+            SET r.valid = false, r.invalidated_at = timestamp()
             RETURN
                 n.name AS source,
                 m.name AS target,
@@ -512,10 +521,13 @@ class MemoryGraph:
                 ON CREATE SET
                     r.created_at = timestamp(),
                     r.updated_at = timestamp(),
-                    r.mentions = 1
+                    r.mentions = 1,
+                    r.valid = true
                 ON MATCH SET
                     r.mentions = CASE WHEN r.mentions IS NULL THEN 1 ELSE r.mentions + 1 END,
-                    r.updated_at = timestamp()
+                    r.valid = true,
+                    r.updated_at = timestamp(),
+                    r.invalidated_at = null
                 RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                 """
 
@@ -556,10 +568,13 @@ class MemoryGraph:
                 ON CREATE SET
                     r.created_at = timestamp(),
                     r.updated_at = timestamp(),
-                    r.mentions = 1
+                    r.mentions = 1,
+                    r.valid = true
                 ON MATCH SET
                     r.mentions = CASE WHEN r.mentions IS NULL THEN 1 ELSE r.mentions + 1 END,
-                    r.updated_at = timestamp()
+                    r.valid = true,
+                    r.updated_at = timestamp(),
+                    r.invalidated_at = null
                 RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                 """
 
@@ -587,10 +602,13 @@ class MemoryGraph:
                 ON CREATE SET
                     r.created_at = timestamp(),
                     r.updated_at = timestamp(),
-                    r.mentions = 1
+                    r.mentions = 1,
+                    r.valid = true
                 ON MATCH SET
                     r.mentions = CASE WHEN r.mentions IS NULL THEN 1 ELSE r.mentions + 1 END,
-                    r.updated_at = timestamp()
+                    r.valid = true,
+                    r.updated_at = timestamp(),
+                    r.invalidated_at = null
                 RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                 """
 
@@ -639,10 +657,13 @@ class MemoryGraph:
                 ON CREATE SET
                     r.created_at = timestamp(),
                     r.updated_at = timestamp(),
-                    r.mentions = 1
+                    r.mentions = 1,
+                    r.valid = true
                 ON MATCH SET
                     r.mentions = CASE WHEN r.mentions IS NULL THEN 1 ELSE r.mentions + 1 END,
-                    r.updated_at = timestamp()
+                    r.valid = true,
+                    r.updated_at = timestamp(),
+                    r.invalidated_at = null
                 RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                 """
 
