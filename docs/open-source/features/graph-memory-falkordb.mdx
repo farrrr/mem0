@@ -45,7 +45,7 @@ config = {
         "config": {
             "host": "localhost",
             "port": 6379,
-            "graph_name": "mem0_graph",
+            "database": "mem0",
         },
     },
 }
@@ -79,7 +79,7 @@ for hit in results["results"]:
 | `port` | int | `6379` | FalkorDB server port |
 | `username` | string | `None` | Username for authentication (optional) |
 | `password` | string | `None` | Password for authentication (optional) |
-| `graph_name` | string | `"mem0_graph"` | Name of the graph in FalkorDB |
+| `database` | string | `"mem0"` | Graph name prefix in FalkorDB (each user gets `{database}_{user_id}`) |
 
 <Note>
 When using authentication, both `username` and `password` must be provided together.
@@ -119,7 +119,7 @@ config = {
         "config": {
             "host": "localhost",
             "port": 6379,
-            "graph_name": "my_app_graph",
+            "database": "my_app",
         },
         "llm": {
             "provider": "openai",
