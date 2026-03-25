@@ -97,12 +97,20 @@ class ApacheAgeConfig(BaseModel):
         return values
 
 
+class FalkorDBConfig(BaseModel):
+    host: str = Field("localhost", description="Host address for the FalkorDB server")
+    port: int = Field(6379, description="Port for the FalkorDB server")
+    username: Optional[str] = Field(None, description="Username for FalkorDB authentication")
+    password: Optional[str] = Field(None, description="Password for FalkorDB authentication")
+    graph_name: str = Field("mem0_graph", description="Name of the graph in FalkorDB")
+
+
 class GraphStoreConfig(BaseModel):
     provider: str = Field(
-        description="Provider of the data store (e.g., 'neo4j', 'memgraph', 'neptune', 'kuzu', 'apache_age')",
+        description="Provider of the data store (e.g., 'neo4j', 'memgraph', 'neptune', 'kuzu', 'apache_age', 'falkordb')",
         default="neo4j",
     )
-    config: Union[Neo4jConfig, MemgraphConfig, NeptuneConfig, KuzuConfig, ApacheAgeConfig] = Field(
+    config: Union[Neo4jConfig, MemgraphConfig, NeptuneConfig, KuzuConfig, ApacheAgeConfig, FalkorDBConfig] = Field(
         description="Configuration for the specific data store", default=None
     )
     llm: Optional[LlmConfig] = Field(description="LLM configuration for querying the graph store", default=None)
@@ -132,5 +140,7 @@ class GraphStoreConfig(BaseModel):
             return KuzuConfig(**v.model_dump())
         elif provider == "apache_age":
             return ApacheAgeConfig(**v.model_dump())
+        elif provider == "falkordb":
+            return FalkorDBConfig(**v.model_dump())
         else:
             raise ValueError(f"Unsupported graph store provider: {provider}")
