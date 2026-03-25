@@ -114,6 +114,10 @@ class GraphStoreConfig(BaseModel):
         description="Configuration for the specific data store", default=None
     )
     llm: Optional[LlmConfig] = Field(description="LLM configuration for querying the graph store", default=None)
+    fallback_llm: Optional[LlmConfig] = Field(
+        description="Fallback LLM for graph entity/relation extraction when primary LLM returns incomplete results",
+        default=None,
+    )
     custom_prompt: Optional[str] = Field(
         description="Custom prompt to fetch entities from the given text", default=None
     )
