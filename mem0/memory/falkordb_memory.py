@@ -2,7 +2,7 @@ import logging
 
 from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
 
-# Required keys for a valid entity from LLM tool calls
+# Required keys for a valid entity/relation from LLM tool calls
 _ENTITY_REQUIRED_KEYS = {"source", "relationship", "destination"}
 
 try:
@@ -80,6 +80,17 @@ class MemoryGraph:
         elif hasattr(self.config.llm, "config"):
             llm_config = self.config.llm.config
         self.llm = LlmFactory.create(self.llm_provider, llm_config)
+
+        # Fallback LLM: retry entity/relation extraction when primary LLM returns empty or malformed results
+        self.fallback_llm = None
+        self.fallback_llm_provider = None
+        if hasattr(self.config.graph_store, 'fallback_llm') and self.config.graph_store.fallback_llm:
+            fb_config = self.config.graph_store.fallback_llm
+            if hasattr(fb_config, 'provider') and hasattr(fb_config, 'config'):
+                self.fallback_llm = LlmFactory.create(fb_config.provider, fb_config.config)
+                self.fallback_llm_provider = fb_config.provider
+                logger.info("Graph fallback LLM configured: %s", fb_config.provider)
+
         self.user_id = None
         # Use threshold from graph_store config, default to 0.7 for backward compatibility
         self.threshold = self.config.graph_store.threshold if hasattr(self.config.graph_store, 'threshold') else 0.7
@@ -247,6 +258,7 @@ class MemoryGraph:
         )
 
         entity_type_map = {}
+        _parse_failed = False
 
         try:
             for tool_call in search_results["tool_calls"]:
@@ -255,9 +267,43 @@ class MemoryGraph:
                 for item in tool_call.get("arguments", {}).get("entities", []):
                     entity_type_map[item["entity"]] = item["entity_type"]
         except Exception as e:
+            _parse_failed = True
             logger.exception(
                 f"Error in search tool: {e}, llm_provider={self.llm_provider}, search_results={search_results}"
             )
+
+        # Fallback to backup LLM when primary returns empty or malformed results
+        if (not entity_type_map or _parse_failed) and self.fallback_llm:
+            logger.warning("Primary LLM entity extraction returned empty/malformed, retrying with fallback LLM")
+            try:
+                _messages = [
+                    {
+                        "role": "system",
+                        "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
+                    },
+                    {"role": "user", "content": data},
+                ]
+                # Select tools matching the fallback LLM provider
+                fb_tools = [EXTRACT_ENTITIES_TOOL]
+                if self.fallback_llm_provider in ["azure_openai_structured", "openai_structured"]:
+                    fb_tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
+                fb_results = self.fallback_llm.generate_response(
+                    messages=_messages,
+                    tools=fb_tools,
+                )
+                fb_entity_type_map = {}
+                for tool_call in fb_results.get("tool_calls", []):
+                    if tool_call.get("name") != "extract_entities":
+                        continue
+                    for item in tool_call.get("arguments", {}).get("entities", []):
+                        fb_entity_type_map[item["entity"]] = item["entity_type"]
+                if fb_entity_type_map:
+                    logger.info("Fallback LLM entity extraction succeeded: %d entities", len(fb_entity_type_map))
+                    entity_type_map = fb_entity_type_map
+                else:
+                    logger.info("Fallback LLM entity extraction also returned empty results")
+            except Exception as e:
+                logger.exception(f"Fallback LLM entity extraction failed: {e}")
 
         entity_type_map = {k.lower().replace(" ", "_"): v.lower().replace(" ", "_") for k, v in entity_type_map.items()}
         logger.debug(f"Entity type map: {entity_type_map}\n search_results={search_results}")
@@ -301,7 +347,8 @@ class MemoryGraph:
         if extracted_entities.get("tool_calls"):
             entities = extracted_entities["tool_calls"][0].get("arguments", {}).get("entities", [])
 
-        # Filter out entities with missing or invalid fields (defensive against incomplete LLM tool calls)
+        # Filter out entities with missing or invalid fields BEFORE _remove_spaces_from_entities,
+        # because _remove_spaces accesses item["source"] etc. directly and would KeyError on incomplete entities.
         valid_entities = []
         for entity in entities:
             missing = _ENTITY_REQUIRED_KEYS - entity.keys()
@@ -311,8 +358,56 @@ class MemoryGraph:
                 logger.warning("[_establish_nodes_relations] Skipping entity with empty/non-string values: entity=%s", entity)
             else:
                 valid_entities.append(entity)
-        entities = valid_entities
 
+        # Fallback to backup LLM only when primary returns NO valid entities at all.
+        # If primary returned some valid entities, keep them rather than discarding and retrying.
+        if not valid_entities and self.fallback_llm:
+            logger.warning(
+                "Primary LLM returned 0 valid entities (out of %d raw), retrying with fallback LLM",
+                len(entities),
+            )
+            try:
+                # Select tools matching the fallback LLM provider
+                fb_tools = [RELATIONS_TOOL]
+                if self.fallback_llm_provider in ["azure_openai_structured", "openai_structured"]:
+                    fb_tools = [RELATIONS_STRUCT_TOOL]
+                fallback_result = self.fallback_llm.generate_response(
+                    messages=messages,
+                    tools=fb_tools,
+                )
+                fallback_entities = []
+                if fallback_result.get("tool_calls"):
+                    fallback_entities = (
+                        fallback_result["tool_calls"][0]
+                        .get("arguments", {})
+                        .get("entities", [])
+                    )
+                # Validate BEFORE _remove_spaces (same pattern as primary path)
+                fb_valid = [
+                    e for e in fallback_entities
+                    if _ENTITY_REQUIRED_KEYS <= e.keys()
+                    and all(isinstance(e.get(k), str) and e[k].strip() for k in _ENTITY_REQUIRED_KEYS)
+                ]
+                fb_valid = self._remove_spaces_from_entities(fb_valid)
+                if len(fb_valid) > len(valid_entities):
+                    logger.info(
+                        "Fallback LLM produced better results: %d valid vs original %d valid",
+                        len(fb_valid), len(valid_entities),
+                    )
+                    entities = fb_valid
+                else:
+                    entities = valid_entities
+                    logger.info(
+                        "Fallback LLM did not improve results, using original: %d valid",
+                        len(valid_entities),
+                    )
+            except Exception as e:
+                logger.exception(f"Fallback LLM relation extraction failed: {e}")
+                entities = valid_entities
+        else:
+            entities = valid_entities
+
+        # Normalize after validation (safe: all entities have required keys at this point)
         entities = self._remove_spaces_from_entities(entities)
         logger.debug(f"Extracted entities: {entities}")
         return entities
