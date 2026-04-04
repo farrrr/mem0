@@ -37,6 +37,19 @@ def _make_empty_result():
     return result
 
 
+def _make_graph_wrapper_mock():
+    """Create a properly configured graph_wrapper mock.
+
+    The graph_wrapper proxies .query() calls to the per-user FalkorDB graph,
+    and also exposes delete_graph() and reset_all_graphs().
+    """
+    wrapper = MagicMock()
+    wrapper.query.return_value = []
+    wrapper._database = "test_db"
+    wrapper._get_graph.return_value = MagicMock()
+    return wrapper
+
+
 def _make_instance(*, fallback_llm=None, custom_prompt=None, threshold=0.7):
     """Create a MemoryGraph instance with mocked internals (bypass __init__)."""
     with patch.object(MemoryGraph, "__init__", return_value=None):
@@ -47,9 +60,7 @@ def _make_instance(*, fallback_llm=None, custom_prompt=None, threshold=0.7):
         inst.config.embedder.provider = "openai"
         inst.config.embedder.config = {"model": "text-embedding-3-small", "api_key": "sk-test"}
 
-        inst.driver = MagicMock()
-        inst.graph = MagicMock()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper = _make_graph_wrapper_mock()
 
         inst.embedding_model = MagicMock()
         inst.embedding_model.embed.return_value = [0.1] * 128
@@ -60,6 +71,12 @@ def _make_instance(*, fallback_llm=None, custom_prompt=None, threshold=0.7):
         inst.fallback_llm_provider = "openai" if fallback_llm else None
         inst.user_id = None
         inst.threshold = threshold
+
+        # Attributes added in refactored __init__
+        inst._indexed_user_graphs = set()
+        inst.use_base_label = True
+        inst.node_label = ":`__Entity__`"
+
         return inst
 
 
@@ -76,7 +93,7 @@ class TestInit:
     """Tests for MemoryGraph.__init__ configuration wiring."""
 
     def test_init_sets_basic_attributes(self):
-        """Init should wire up graph, embedding_model, llm, threshold."""
+        """Init should wire up graph_wrapper, embedding_model, llm, threshold."""
         config = MagicMock()
         config.graph_store.config.host = "localhost"
         config.graph_store.config.port = 6379
@@ -253,6 +270,10 @@ class TestAdd:
 class TestSearch:
     """Tests for the search() method (vector search + BM25 reranking)."""
 
+    def setup_method(self):
+        """Reset the module-level rank_bm25 mock between tests."""
+        _rank_bm25_mock.reset_mock()
+
     def test_returns_empty_when_no_search_output(self):
         """search() should return [] when _search_graph_db yields nothing."""
         inst = _make_instance()
@@ -309,7 +330,7 @@ class TestDelete:
     """Tests for the delete() method (graph cleanup for memory deletion)."""
 
     def test_delete_extracts_and_deletes_entities(self):
-        """delete() should extract entities then soft-delete matching relationships."""
+        """delete() should extract entities then delete matching relationships."""
         inst = _make_instance()
         inst._retrieve_nodes_from_data = MagicMock(return_value={"alice": "person"})
         inst._establish_nodes_relations_from_data = MagicMock(return_value=[
@@ -345,52 +366,50 @@ class TestDelete:
 # ===========================================================================
 
 class TestDeleteEntities:
-    """Tests for _delete_entities (soft-delete: SET r.valid = false)."""
+    """Tests for _delete_entities (hard delete: DELETE r)."""
 
-    def test_soft_delete_sets_valid_false(self):
-        """_delete_entities should issue SET r.valid = false in Cypher."""
+    def test_hard_delete_removes_relationship(self):
+        """_delete_entities should issue DELETE r in Cypher."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result(
-            ["source", "target", "relationship"],
-            [["alice", "bob", "knows"]],
-        )
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "target": "bob", "relationship": "knows"},
+        ]
 
         to_delete = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         results = inst._delete_entities(to_delete, _FILTERS)
 
         assert len(results) == 1
-        cypher = inst.graph.query.call_args[0][0]
-        assert "r.valid = false" in cypher
-        assert "r.invalidated_at = timestamp()" in cypher
+        cypher = inst.graph_wrapper.query.call_args[0][0]
+        assert "DELETE r" in cypher
 
-    def test_soft_delete_backtick_wraps_relationship(self):
+    def test_backtick_wraps_relationship(self):
         """Relationship types must be backtick-wrapped in Cypher."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         to_delete = [{"source": "rei", "destination": "python", "relationship": "likes"}]
         inst._delete_entities(to_delete, _FILTERS)
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert ":`likes`" in cypher
 
-    def test_soft_delete_with_agent_id_filter(self):
-        """Filters with agent_id should appear in WHERE clause."""
+    def test_with_agent_id_filter(self):
+        """Filters with agent_id should appear in node props."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         to_delete = [{"source": "x", "destination": "y", "relationship": "r"}]
         inst._delete_entities(to_delete, _FILTERS_AGENT)
 
-        params = inst.graph.query.call_args[0][1]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["agent_id"] == "a1"
-        cypher = inst.graph.query.call_args[0][0]
         assert "agent_id" in cypher
 
-    def test_soft_delete_multiple_items(self):
-        """Each item in to_be_deleted should produce one graph.query call."""
+    def test_multiple_items(self):
+        """Each item in to_be_deleted should produce one graph_wrapper.query call."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         items = [
             {"source": "a", "destination": "b", "relationship": "r1"},
@@ -399,12 +418,12 @@ class TestDeleteEntities:
         results = inst._delete_entities(items, _FILTERS)
 
         assert len(results) == 2
-        assert inst.graph.query.call_count == 2
+        assert inst.graph_wrapper.query.call_count == 2
 
-    def test_soft_delete_skips_item_missing_fields(self):
+    def test_skips_item_missing_fields(self):
         """Items missing required fields should be skipped gracefully."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         items = [
             {"source": "a"},  # missing destination and relationship
@@ -415,12 +434,12 @@ class TestDeleteEntities:
         # Only the valid item should produce a result
         assert len(results) == 1
         # Verify only one query was executed (invalid item was skipped)
-        assert inst.graph.query.call_count == 1
+        assert inst.graph_wrapper.query.call_count == 1
 
-    def test_soft_delete_skips_empty_string_values(self):
+    def test_skips_empty_string_values(self):
         """Items with empty string values should be skipped."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         items = [
             {"source": "", "destination": "d", "relationship": "r"},
@@ -428,18 +447,7 @@ class TestDeleteEntities:
         ]
         results = inst._delete_entities(items, _FILTERS)
         assert len(results) == 1
-        assert inst.graph.query.call_count == 1
-
-    def test_soft_delete_only_targets_valid_relationships(self):
-        """WHERE clause should include (r.valid IS NULL OR r.valid = true)."""
-        inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
-
-        to_delete = [{"source": "a", "destination": "b", "relationship": "r"}]
-        inst._delete_entities(to_delete, _FILTERS)
-
-        cypher = inst.graph.query.call_args[0][0]
-        assert "r.valid IS NULL OR r.valid = true" in cypher
+        assert inst.graph_wrapper.query.call_count == 1
 
 
 # ===========================================================================
@@ -447,42 +455,39 @@ class TestDeleteEntities:
 # ===========================================================================
 
 class TestDeleteAll:
-    """Tests for delete_all() (hard delete: DETACH DELETE)."""
+    """Tests for delete_all() (hard delete: DETACH DELETE or graph deletion)."""
 
     def test_delete_all_with_user_id_only(self):
-        """delete_all should issue DETACH DELETE with user_id filter."""
+        """delete_all with only user_id should call graph_wrapper.delete_graph()."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
 
         inst.delete_all(_FILTERS)
 
-        cypher = inst.graph.query.call_args[0][0]
-        assert "DETACH DELETE n" in cypher
-        params = inst.graph.query.call_args[0][1]
-        assert params["user_id"] == "u1"
+        inst.graph_wrapper.delete_graph.assert_called_once_with("u1")
 
     def test_delete_all_with_agent_id(self):
-        """delete_all with agent_id should include it in WHERE clause."""
+        """delete_all with agent_id should issue DETACH DELETE with agent_id filter."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         inst.delete_all(_FILTERS_AGENT)
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
+        assert "DETACH DELETE n" in cypher
         assert "agent_id" in cypher
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["agent_id"] == "a1"
 
     def test_delete_all_with_run_id(self):
-        """delete_all with run_id should include it in WHERE clause."""
+        """delete_all with run_id should include it in node props."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
+        inst.graph_wrapper.query.return_value = []
 
         inst.delete_all(_FILTERS_RUN)
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "run_id" in cypher
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["run_id"] == "r1"
 
 
@@ -496,13 +501,10 @@ class TestGetAll:
     def test_returns_formatted_results(self):
         """get_all should return list of dicts with source/relationship/target."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result(
-            ["source", "relationship", "target"],
-            [
-                ["alice", "KNOWS", "bob"],
-                ["alice", "LIKES", "hiking"],
-            ],
-        )
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "KNOWS", "target": "bob"},
+            {"source": "alice", "relationship": "LIKES", "target": "hiking"},
+        ]
 
         results = inst.get_all(_FILTERS, limit=10)
 
@@ -511,41 +513,41 @@ class TestGetAll:
         assert results[1] == {"source": "alice", "relationship": "LIKES", "target": "hiking"}
 
     def test_get_all_respects_limit_param(self):
-        """The limit parameter should be passed as $limit in Cypher params."""
+        """The limit parameter should appear in the Cypher LIMIT clause."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
         inst.get_all(_FILTERS, limit=42)
 
-        params = inst.graph.query.call_args[0][1]
-        assert params["limit"] == 42
+        cypher = inst.graph_wrapper.query.call_args[0][0]
+        assert "LIMIT 42" in cypher
 
     def test_get_all_with_agent_id_filter(self):
-        """get_all should include agent_id in WHERE clause."""
+        """get_all should include agent_id in node props."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
         inst.get_all(_FILTERS_AGENT, limit=5)
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "agent_id" in cypher
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["agent_id"] == "a1"
 
     def test_get_all_filters_invalid_relationships(self):
         """get_all query should include valid relationship filter."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
         inst.get_all(_FILTERS, limit=10)
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "r.valid IS NULL OR r.valid = true" in cypher
 
     def test_get_all_empty_returns_empty_list(self):
         """get_all should return [] when no results."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
         results = inst.get_all(_FILTERS)
         assert results == []
@@ -558,16 +560,23 @@ class TestGetAll:
 class TestReset:
     """Tests for reset()."""
 
-    def test_reset_issues_detach_delete_all(self):
-        """reset() should issue MATCH (n) DETACH DELETE n."""
+    def test_reset_calls_reset_all_graphs(self):
+        """reset() should call graph_wrapper.reset_all_graphs()."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_empty_result()
 
         inst.reset()
 
-        cypher = inst.graph.query.call_args[0][0]
-        assert "MATCH (n)" in cypher
-        assert "DETACH DELETE n" in cypher
+        inst.graph_wrapper.reset_all_graphs.assert_called_once()
+
+    def test_reset_clears_indexed_cache(self):
+        """reset() should clear the _indexed_user_graphs cache."""
+        inst = _make_instance()
+        inst._indexed_user_graphs.add("user1")
+        inst._indexed_user_graphs.add("user2")
+
+        inst.reset()
+
+        assert inst._indexed_user_graphs == set()
 
 
 # ===========================================================================
@@ -685,71 +694,87 @@ class TestBatchEmbed:
 # ===========================================================================
 
 class TestAddEntities:
-    """Tests for _add_entities (4 cases: source found/not x dest found/not)."""
-
-    def _setup(self, source_result=None, dest_result=None):
-        """Build an instance with mocked _search_source_node / _search_destination_node."""
-        inst = _make_instance()
-        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
-        inst._search_source_node = MagicMock(return_value=source_result or [])
-        inst._search_destination_node = MagicMock(return_value=dest_result or [])
-        inst.graph.query.return_value = _make_query_result(
-            ["source", "relationship", "target"],
-            [["a", "r", "b"]],
-        )
-        return inst
+    """Tests for _add_entities (node lookup via _search_node_by_embedding)."""
 
     def test_both_nodes_not_found_creates_both(self):
         """When neither source nor dest exist, MERGE both nodes."""
-        inst = self._setup(source_result=[], dest_result=[])
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(return_value=None)
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         result = inst._add_entities(data, _FILTERS, {"alice": "person", "bob": "person"})
 
         assert len(result) == 1
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "MERGE (source" in cypher
         assert "MERGE (destination" in cypher
 
     def test_source_found_dest_not(self):
         """When source exists but dest does not, MATCH source + MERGE dest."""
-        source_hit = [{"id(source_candidate)": 42, "source_candidate.name": "alice", "source_similarity": 0.95}]
-        inst = self._setup(source_result=source_hit, dest_result=[])
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        # Return node_id for first call (source=alice), None for second (dest=bob)
+        inst._search_node_by_embedding = MagicMock(side_effect=[42, None])
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         result = inst._add_entities(data, _FILTERS, {"alice": "person"})
 
         assert len(result) == 1
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "id(source) = $source_id" in cypher
         assert "MERGE (destination" in cypher
 
     def test_dest_found_source_not(self):
         """When dest exists but source does not, MERGE source + MATCH dest."""
-        dest_hit = [{"id(destination_candidate)": 99, "destination_candidate.name": "bob", "destination_similarity": 0.95}]
-        inst = self._setup(source_result=[], dest_result=dest_hit)
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        # Return None for first call (source=alice), node_id for second (dest=bob)
+        inst._search_node_by_embedding = MagicMock(side_effect=[None, 99])
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         result = inst._add_entities(data, _FILTERS, {})
 
         assert len(result) == 1
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "id(destination) = $destination_id" in cypher
         assert "MERGE (source" in cypher
 
     def test_both_nodes_found(self):
         """When both nodes exist, MATCH both and MERGE relationship."""
-        source_hit = [{"id(source_candidate)": 42, "source_candidate.name": "alice", "source_similarity": 0.95}]
-        dest_hit = [{"id(destination_candidate)": 99, "destination_candidate.name": "bob", "destination_similarity": 0.95}]
-        inst = self._setup(source_result=source_hit, dest_result=dest_hit)
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(side_effect=[42, 99])
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         result = inst._add_entities(data, _FILTERS, {})
 
         assert len(result) == 1
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "id(source) = $source_id" in cypher
         assert "id(destination) = $destination_id" in cypher
 
     def test_skips_item_missing_required_fields(self):
         """Items missing source/destination/relationship should be skipped."""
-        inst = self._setup()
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(return_value=None)
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [
             {"source": "alice"},  # missing destination and relationship
             {"source": "alice", "destination": "bob", "relationship": "knows"},
@@ -759,7 +784,13 @@ class TestAddEntities:
 
     def test_skips_item_with_empty_string_values(self):
         """Items with empty string values should be skipped."""
-        inst = self._setup()
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(return_value=None)
+        inst.graph_wrapper.query.return_value = [
+            {"source": "alice", "relationship": "knows", "target": "bob"},
+        ]
+
         data = [
             {"source": "", "destination": "bob", "relationship": "knows"},
             {"source": "alice", "destination": "bob", "relationship": "knows"},
@@ -774,20 +805,28 @@ class TestAddEntities:
 
     def test_relationship_backtick_wrapped(self):
         """Relationship in Cypher should be backtick-wrapped."""
-        inst = self._setup()
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(return_value=None)
+        inst.graph_wrapper.query.return_value = []
+
         data = [{"source": "alice", "destination": "bob", "relationship": "works_at"}]
         inst._add_entities(data, _FILTERS, {})
 
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert ":`works_at`" in cypher
 
     def test_add_entities_with_agent_and_run_filters(self):
-        """_add_entities should include agent_id and run_id in MERGE props when provided."""
-        inst = self._setup()
+        """_add_entities should include agent_id and run_id in node props when provided."""
+        inst = _make_instance()
+        inst._batch_embed = MagicMock(return_value=[[0.1] * 4, [0.2] * 4])
+        inst._search_node_by_embedding = MagicMock(return_value=None)
+        inst.graph_wrapper.query.return_value = []
+
         data = [{"source": "alice", "destination": "bob", "relationship": "knows"}]
         inst._add_entities(data, _FILTERS_RUN, {})
 
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params.get("agent_id") == "a1"
         assert params.get("run_id") == "r1"
 
@@ -966,15 +1005,19 @@ class TestSearchGraphDB:
     """Tests for _search_graph_db (vector search pipeline)."""
 
     def test_returns_parsed_results(self):
-        """_search_graph_db should parse FalkorDB result_set into dicts."""
+        """_search_graph_db should parse results from graph_wrapper.query."""
         inst = _make_instance()
         inst.embedding_model.embed.return_value = [0.1] * 4
 
-        result = _make_query_result(
-            ["source", "source_id", "relationship", "relation_id", "destination", "destination_id", "similarity"],
-            [["alice", 1, "knows", 100, "bob", 2, 0.95]],
-        )
-        inst.graph.query.return_value = result
+        # First call: vector search returns similar nodes
+        # Second call: outgoing relations
+        # Third call: incoming relations
+        inst.graph_wrapper.query.side_effect = [
+            [{"node_id": 1, "node_name": "alice", "score": 0.95}],
+            [{"source": "alice", "source_id": 1, "relationship": "knows",
+              "relation_id": 100, "destination": "bob", "destination_id": 2}],
+            [],  # no incoming
+        ]
 
         results = inst._search_graph_db(["alice"], _FILTERS)
         assert len(results) == 1
@@ -987,10 +1030,10 @@ class TestSearchGraphDB:
         assert results == []
 
     def test_no_results_returns_empty(self):
-        """When vector search returns empty result_set, should return []."""
+        """When vector search returns empty results, should return []."""
         inst = _make_instance()
         inst.embedding_model.embed.return_value = [0.1] * 4
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
         results = inst._search_graph_db(["alice"], _FILTERS)
         assert results == []
@@ -1092,62 +1135,54 @@ class TestEstablishNodesRelationsFromData:
 
 
 # ===========================================================================
-# TestSearchSourceAndDestNode
+# TestSearchNodeByEmbedding
 # ===========================================================================
 
-class TestSearchSourceAndDestNode:
-    """Tests for _search_source_node and _search_destination_node."""
+class TestSearchNodeByEmbedding:
+    """Tests for _search_node_by_embedding (vector-based node lookup)."""
 
-    def test_search_source_node_returns_parsed_results(self):
-        """_search_source_node should return parsed list of dicts."""
+    def test_returns_node_id_when_found(self):
+        """_search_node_by_embedding should return node_id when a match exists."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result(
-            ["id(source_candidate)", "source_candidate.name", "source_similarity"],
-            [[42, "alice", 0.95]],
-        )
+        inst.graph_wrapper.query.return_value = [{"node_id": 42}]
 
-        result = inst._search_source_node([0.1] * 4, _FILTERS, threshold=0.9)
-        assert len(result) == 1
-        assert result[0]["id(source_candidate)"] == 42
+        result = inst._search_node_by_embedding([0.1] * 4, _FILTERS)
+        assert result == 42
 
-    def test_search_source_node_empty_returns_empty(self):
-        """_search_source_node should return [] when no matches."""
+    def test_returns_none_when_not_found(self):
+        """_search_node_by_embedding should return None when no matches."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
-        result = inst._search_source_node([0.1] * 4, _FILTERS, threshold=0.9)
-        assert result == []
+        result = inst._search_node_by_embedding([0.1] * 4, _FILTERS)
+        assert result is None
 
-    def test_search_destination_node_returns_parsed_results(self):
-        """_search_destination_node should return parsed list of dicts."""
+    def test_includes_agent_id_in_params(self):
+        """_search_node_by_embedding should include agent_id when provided."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result(
-            ["id(destination_candidate)", "destination_candidate.name", "destination_similarity"],
-            [[99, "bob", 0.92]],
-        )
+        inst.graph_wrapper.query.return_value = []
 
-        result = inst._search_destination_node([0.2] * 4, _FILTERS, threshold=0.8)
-        assert len(result) == 1
-        assert result[0]["id(destination_candidate)"] == 99
+        inst._search_node_by_embedding([0.1] * 4, _FILTERS_AGENT)
 
-    def test_search_source_with_agent_filter(self):
-        """_search_source_node should include agent_id in query params when provided."""
-        inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
-
-        inst._search_source_node([0.1] * 4, _FILTERS_AGENT, threshold=0.9)
-
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["agent_id"] == "a1"
-        cypher = inst.graph.query.call_args[0][0]
+        cypher = inst.graph_wrapper.query.call_args[0][0]
         assert "agent_id" in cypher
 
-    def test_search_destination_with_run_filter(self):
-        """_search_destination_node should include run_id when provided."""
+    def test_includes_run_id_in_params(self):
+        """_search_node_by_embedding should include run_id when provided."""
         inst = _make_instance()
-        inst.graph.query.return_value = _make_query_result([], [])
+        inst.graph_wrapper.query.return_value = []
 
-        inst._search_destination_node([0.1] * 4, _FILTERS_RUN, threshold=0.9)
+        inst._search_node_by_embedding([0.1] * 4, _FILTERS_RUN)
 
-        params = inst.graph.query.call_args[0][1]
+        params = inst.graph_wrapper.query.call_args.kwargs["params"]
         assert params["run_id"] == "r1"
+
+    def test_handles_vector_index_not_exist(self):
+        """_search_node_by_embedding should return None when query raises exception."""
+        inst = _make_instance()
+        inst.graph_wrapper.query.side_effect = Exception("vector index not found")
+
+        result = inst._search_node_by_embedding([0.1] * 4, _FILTERS)
+        assert result is None
