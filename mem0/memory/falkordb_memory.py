@@ -14,11 +14,6 @@ Key features over Neo4j MemoryGraph:
 import logging
 from collections import OrderedDict
 
-from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
-
-# Required keys for a valid entity/relation from LLM tool calls
-_ENTITY_REQUIRED_KEYS = {"source", "relationship", "destination"}
-
 try:
     from falkordb import FalkorDB
 except ImportError:
@@ -42,7 +37,11 @@ from mem0.graphs.tools import (
     RELATIONS_TOOL,
 )
 from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
+from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
 from mem0.utils.factory import EmbedderFactory, LlmFactory
+
+# Required keys for a valid entity/relation from LLM tool calls
+_ENTITY_REQUIRED_KEYS = {"source", "relationship", "destination"}
 
 logger = logging.getLogger(__name__)
 
