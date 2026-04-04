@@ -55,10 +55,11 @@ class TestAddToVectorStoreErrors:
             )
 
         # Verify
-        assert mock_memory.llm.generate_response.call_count == 1
+        # Expect 3 calls due to fact extraction fallback retry mechanism (3 attempts)
+        assert mock_memory.llm.generate_response.call_count == 3
         assert result == []  # Should return empty list when no memories processed
-        # Check for error message in any of the log records
-        assert any("Error in new_retrieved_facts" in record.msg for record in caplog.records), "Expected error message not found in logs"
+        # Check for retry exhaustion error message in logs
+        assert any("Fact extraction failed after 3 attempts" in record.msg for record in caplog.records), "Expected retry exhaustion error message not found in logs"
         assert mock_capture_event.call_count == 1
 
     def test_empty_llm_response_memory_actions(self, mock_memory, caplog):
@@ -157,10 +158,11 @@ class TestAsyncAddToVectorStoreErrors:
             result = await mock_async_memory._add_to_vector_store(
                 messages=[{"role": "user", "content": "test"}], metadata={}, effective_filters={}, infer=True
             )
-        assert mock_async_memory.llm.generate_response.call_count == 1
+        # Expect 3 calls due to fact extraction fallback retry mechanism (3 attempts)
+        assert mock_async_memory.llm.generate_response.call_count == 3
         assert result == []
-        # Check for error message in any of the log records
-        assert any("Error in new_retrieved_facts" in record.msg for record in caplog.records), "Expected error message not found in logs"
+        # Check for retry exhaustion error message in logs
+        assert any("Fact extraction failed after 3 attempts" in record.msg for record in caplog.records), "Expected retry exhaustion error message not found in logs"
         assert mock_capture_event.call_count == 1
 
     @pytest.mark.asyncio

@@ -55,7 +55,7 @@ def test_generate_response_without_tools(mock_openai_client):
     response = llm.generate_response(messages)
 
     mock_openai_client.chat.completions.create.assert_called_once_with(
-        model="gpt-4.1-nano-2025-04-14", messages=messages, temperature=0.7, max_tokens=100, top_p=1.0, store=False
+        model="gpt-4.1-nano-2025-04-14", messages=messages, temperature=0.7, max_tokens=100, top_p=1.0
     )
     assert response == "I'm doing well, thank you for asking!"
 
@@ -97,7 +97,7 @@ def test_generate_response_with_tools(mock_openai_client):
     response = llm.generate_response(messages, tools=tools)
 
     mock_openai_client.chat.completions.create.assert_called_once_with(
-        model="gpt-4.1-nano-2025-04-14", messages=messages, temperature=0.7, max_tokens=100, top_p=1.0, tools=tools, tool_choice="auto", store=False
+        model="gpt-4.1-nano-2025-04-14", messages=messages, temperature=0.7, max_tokens=100, top_p=1.0, tools=tools, tool_choice="auto"
     )
 
     assert response["content"] == "I've added the memory for you."
