@@ -12,6 +12,7 @@ Key features over Neo4j MemoryGraph:
 """
 
 import logging
+import re
 from collections import OrderedDict
 
 try:
@@ -37,7 +38,7 @@ from mem0.graphs.tools import (
     RELATIONS_TOOL,
 )
 from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
-from mem0.memory.utils import format_entities, sanitize_relationship_for_cypher
+from mem0.memory.utils import format_entities, remove_spaces_from_entities
 from mem0.utils.factory import EmbedderFactory, LlmFactory
 
 # Required keys for a valid entity/relation from LLM tool calls
@@ -65,12 +66,18 @@ class _FalkorDBGraphWrapper:
         self._database = database
         self._graph_cache = OrderedDict()
 
+    @staticmethod
+    def _sanitize_graph_id(raw_id):
+        """Sanitize user_id for use in graph names: keep only [a-zA-Z0-9_-]."""
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", raw_id)
+
     def _get_graph(self, user_id):
         """Get the FalkorDB graph object for the given user_id."""
         if user_id in self._graph_cache:
             self._graph_cache.move_to_end(user_id)
             return self._graph_cache[user_id]
-        graph_name = f"{self._database}_{user_id}"
+        safe_id = self._sanitize_graph_id(user_id)
+        graph_name = f"{self._database}_{safe_id}"
         graph = self._db.select_graph(graph_name)
         self._graph_cache[user_id] = graph
         if len(self._graph_cache) > _MAX_GRAPH_CACHE:
@@ -90,12 +97,13 @@ class _FalkorDBGraphWrapper:
 
     def delete_graph(self, user_id):
         """Delete an entire user graph."""
-        graph_name = f"{self._database}_{user_id}"
+        safe_id = self._sanitize_graph_id(user_id)
+        graph_name = f"{self._database}_{safe_id}"
         try:
             graph = self._db.select_graph(graph_name)
             graph.delete()
-        except Exception:
-            logger.debug("Graph %s not found or already deleted", graph_name)
+        except Exception as e:
+            logger.warning("Failed to delete graph %s: %s", graph_name, e)
         self._graph_cache.pop(user_id, None)
 
     def reset_all_graphs(self):
@@ -201,9 +209,16 @@ class MemoryGraph:
             logger.debug("Vector index may already exist for user %s", user_id)
 
     def _ensure_user_graph_indexes(self, user_id):
-        """Ensure indexes exist for a user's graph (idempotent, cached)."""
+        """Ensure indexes exist for a user's graph (idempotent, cached).
+
+        The cache is bounded: when it exceeds _MAX_GRAPH_CACHE entries it is
+        cleared so that index creation is retried (CREATE INDEX is idempotent
+        and cheap).
+        """
         if user_id in self._indexed_user_graphs:
             return
+        if len(self._indexed_user_graphs) >= _MAX_GRAPH_CACHE:
+            self._indexed_user_graphs.clear()
         if self.use_base_label:
             self._ensure_indexes(user_id=user_id)
         self._indexed_user_graphs.add(user_id)
@@ -367,6 +382,8 @@ class MemoryGraph:
             RETURN n.name AS source, type(r) AS relationship, m.name AS target
             LIMIT {int(limit)}
             """
+            # Note: LIMIT does not support parameterization in FalkorDB/Cypher.
+            # int() cast ensures safe integer coercion to prevent injection.
         else:
             query = f"""
             MATCH (n {self.node_label})-[r]->(m {self.node_label})
@@ -374,6 +391,8 @@ class MemoryGraph:
             RETURN n.name AS source, type(r) AS relationship, m.name AS target
             LIMIT {int(limit)}
             """
+            # Note: LIMIT does not support parameterization in FalkorDB/Cypher.
+            # int() cast ensures safe integer coercion to prevent injection.
         results = self.graph_wrapper.query(query, params=params, user_id=uid)
 
         final_results = []
@@ -552,7 +571,7 @@ class MemoryGraph:
                     if _ENTITY_REQUIRED_KEYS <= e.keys()
                     and all(isinstance(e.get(k), str) and e[k].strip() for k in _ENTITY_REQUIRED_KEYS)
                 ]
-                fb_valid = self._remove_spaces_from_entities(fb_valid)
+                # Do NOT sanitize here; the unified sanitize at the end of this method handles it
                 if len(fb_valid) > len(valid_entities):
                     logger.info(
                         "Fallback LLM produced better results: %d valid vs original %d valid",
@@ -633,6 +652,8 @@ class MemoryGraph:
                 where_clauses.append("node.run_id = $run_id")
             where_str = " AND ".join(where_clauses)
 
+            # Note: LIMIT and queryNodes topK do not support parameterization in FalkorDB/Cypher.
+            # int() cast ensures safe integer coercion to prevent injection.
             vector_query = f"""
             CALL db.idx.vector.queryNodes('{label}', 'embedding', {int(limit)}, vecf32($n_embedding))
             YIELD node, score
@@ -676,13 +697,14 @@ class MemoryGraph:
                 result_relations.extend(out_results)
                 result_relations.extend(in_results)
 
-        # Deduplicate by relation_id
+        # Deduplicate by relation_id (skip None ids to avoid false dedup)
         seen = set()
         unique_results = []
         for r in result_relations:
             rid = r.get("relation_id")
-            if rid not in seen:
-                seen.add(rid)
+            if rid is None or rid not in seen:
+                if rid is not None:
+                    seen.add(rid)
                 unique_results.append(r)
 
         return unique_results
@@ -723,7 +745,7 @@ class MemoryGraph:
             -[r:`{relationship}`]->
             (m {self.node_label} {{{dest_props_str}}})
             WITH n, r, m, n.name AS source, m.name AS target, type(r) AS rel_type
-            DELETE r
+            SET r.valid = false, r.invalidated_at = timestamp()
             RETURN source, target, rel_type AS relationship
             """
             result = self.graph_wrapper.query(cypher, params=params, user_id=uid)
@@ -1031,16 +1053,7 @@ class MemoryGraph:
     # Utilities
     # ------------------------------------------------------------------
 
-    def _remove_spaces_from_entities(self, entity_list):
-        for item in entity_list:
-            # Defensive: skip items with missing required fields
-            missing = _ENTITY_REQUIRED_KEYS - item.keys()
-            if missing:
-                logger.warning("[_remove_spaces_from_entities] Skipping item with missing fields: missing=%s, item=%s", missing, item)
-                continue
-            item["source"] = item["source"].lower().replace(" ", "_")
-            item["relationship"] = sanitize_relationship_for_cypher(
-                item["relationship"].lower().replace(" ", "_")
-            )
-            item["destination"] = item["destination"].lower().replace(" ", "_")
-        return entity_list
+    @staticmethod
+    def _remove_spaces_from_entities(entity_list):
+        """Normalize entity dicts using the shared utility from mem0.memory.utils."""
+        return remove_spaces_from_entities(entity_list, sanitize_relationship=True)

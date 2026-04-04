@@ -80,6 +80,7 @@ for hit in results["results"]:
 | `username` | string | `None` | Username for authentication (optional) |
 | `password` | string | `None` | Password for authentication (optional) |
 | `database` | string | `"mem0"` | Graph name prefix in FalkorDB (each user gets `{database}_{user_id}`) |
+| `base_label` | bool | `true` | When `true`, all nodes use the `__Entity__` label (enables shared indexes). When `false`, nodes use their entity-type as label. |
 
 <Note>
 When using authentication, both `username` and `password` must be provided together.

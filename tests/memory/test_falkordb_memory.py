@@ -365,10 +365,10 @@ class TestDelete:
 # ===========================================================================
 
 class TestDeleteEntities:
-    """Tests for _delete_entities (hard delete: DELETE r)."""
+    """Tests for _delete_entities (soft-delete: SET r.valid = false)."""
 
-    def test_hard_delete_removes_relationship(self):
-        """_delete_entities should issue DELETE r in Cypher."""
+    def test_soft_delete_invalidates_relationship(self):
+        """_delete_entities should issue SET r.valid = false in Cypher."""
         inst = _make_instance()
         inst.graph_wrapper.query.return_value = [
             {"source": "alice", "target": "bob", "relationship": "knows"},
@@ -379,7 +379,9 @@ class TestDeleteEntities:
 
         assert len(results) == 1
         cypher = inst.graph_wrapper.query.call_args[0][0]
-        assert "DELETE r" in cypher
+        assert "r.valid = false" in cypher
+        assert "r.invalidated_at = timestamp()" in cypher
+        assert "DELETE r" not in cypher
 
     def test_backtick_wraps_relationship(self):
         """Relationship types must be backtick-wrapped in Cypher."""
@@ -852,13 +854,13 @@ class TestRemoveSpacesFromEntities:
         result = inst._remove_spaces_from_entities(entities)
         assert result[0]["relationship"] == "works_at"
 
-    def test_mutates_in_place_and_returns(self):
-        """_remove_spaces_from_entities should mutate the list in place."""
+    def test_returns_cleaned_list(self):
+        """_remove_spaces_from_entities should return a cleaned list."""
         inst = _make_instance()
         entities = [{"source": "A B", "relationship": "R", "destination": "C D"}]
         returned = inst._remove_spaces_from_entities(entities)
-        assert returned is entities
-        assert entities[0]["source"] == "a_b"
+        assert len(returned) == 1
+        assert returned[0]["source"] == "a_b"
 
 
 # ===========================================================================
