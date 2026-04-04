@@ -2,8 +2,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from mem0.reranker.tei_reranker import TEIReranker
 from mem0.configs.rerankers.tei import TEIRerankerConfig
 
@@ -162,7 +160,7 @@ class TestRerank:
             {"text": "from text"},
             {"content": "from content"},
         ]
-        result = reranker.rerank("query", docs)
+        reranker.rerank("query", docs)
 
         texts_sent = mock_post.call_args[1]["json"]["texts"]
         assert texts_sent == ["from memory", "from text", "from content"]

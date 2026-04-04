@@ -3,8 +3,7 @@
 Mock-based: no actual FalkorDB connection required.
 """
 
-import sys
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 # falkordb and rank_bm25 are optional deps -- mock them so tests run without install
 _falkordb_mock = MagicMock()

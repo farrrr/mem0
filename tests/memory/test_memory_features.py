@@ -6,9 +6,7 @@ Covers:
 """
 
 import json
-from unittest.mock import MagicMock, patch, call
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from mem0.memory.main import Memory
 
@@ -240,6 +238,6 @@ class TestFallbackLLMRetry:
 
         messages = [{"role": "user", "content": "data"}]
         # Should not raise
-        result = m._add_to_vector_store(messages, {}, {"user_id": "u1"}, infer=True)
+        m._add_to_vector_store(messages, {}, {"user_id": "u1"}, infer=True)
 
         assert m.llm.generate_response.call_count == 3
